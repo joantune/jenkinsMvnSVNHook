@@ -1,0 +1,164 @@
+#!/bin/sh
+
+#Copyright 2012 Joao Andre Pereira Antunes
+#
+#      https://github.com/joantune/jenkinsMvnSVNHook
+#
+# This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# General SVN Hook information:
+#
+# POST-COMMIT HOOK
+#
+# The post-commit hook is invoked after a commit.  Subversion runs
+# this hook by invoking a program (script, executable, binary, etc.)
+# named 'post-commit' (for which this file is a template) with the 
+# following ordered arguments:
+#
+#   [1] REPOS-PATH   (the path to this repository)
+#   [2] REV          (the number of the revision just committed)
+#
+# The default working directory for the invocation is undefined, so
+# the program should set one explicitly if it cares.
+#
+# Note that 'post-commit' must be executable by the user(s) who will
+# invoke it (typically the user httpd runs as), and that user must
+# have filesystem-level permission to access the repository.
+#
+# On a Windows system, you should name the hook program
+# 'post-commit.bat' or 'post-commit.exe',
+# but the basic idea is the same.
+# 
+# The hook program typically does not inherit the environment of
+# its parent process.  For example, a common problem is for the
+# PATH environment variable to not be set to its usual value, so
+# that subprograms fail to launch unless invoked via absolute path.
+# If you're having unexpected problems with a hook program, the
+# culprit may be unusual (or missing) environment variables.
+# 
+# For more examples and pre-written hooks, see those in
+# the Subversion repository at
+# http://svn.collab.net/repos/svn/trunk/tools/hook-scripts/ and
+# http://svn.collab.net/repos/svn/trunk/contrib/hook-scripts/
+
+
+REPOS="$1"
+REV="$2"
+
+exec 1>&2
+
+function processMavenizedCommit() {
+
+BASE_SVN_PATH=$1
+TEMPLATE_JOB_NAME=$2
+
+#Debug
+echo "Ran processMavenizedCommit with BASE_SVN_PATH: $BASE_SVN_PATH, and TEMPLATE_JOB_NAME: $TEMPLATE_JOB_NAME";
+
+
+
+#Constants
+        ROOT_URL="https://fenix-ashes.ist.utl.pt/ksvn"
+
+        EXISTENT_MODULES=$(/usr/bin/svnlook tree --revision $REV  --full-paths $REPOS $BASE_SVN_PATH | grep pom.xml)
+        DIRS_CHANGED=$(/usr/bin/svnlook dirs-changed --revision $REV $REPOS)
+        CHANGED_MODULES=""
+        MODIFIED_MODULES=""
+
+for dir in $DIRS_CHANGED
+do
+echo 'processing dir' $dir;
+ for modulePath in $EXISTENT_MODULES
+  do
+   module=$(echo $modulePath | /bin/sed 's/\(.*\)\/\(.*\)\/pom\.xml/\2/') 
+   echo "Got module: $module";
+   echo "Got modulePath: $modulePath";
+   echo 'checking changed dir against  module' $module;
+#   if [[ "$dir" == */"$module"/* ]] &&  ! echo $CHANGED_MODULES | grep $module
+   if [[ "$dir" == trunk/*/"$module"/* ]] &&  ! echo $CHANGED_MODULES | grep $module
+    then
+     echo "Detected that '$module' has changed"
+     echo "SVN URL: http://ROOT_URL/""$modulePath"| /bin/sed "s/\(.*\)\/pom\.xml/\1/"
+     SVN_URL=$(/bin/echo "$ROOT_URL/""$modulePath"| /bin/sed "s/\(.*\)\/pom\.xml/\1/")
+     echo "SVN_URL: $SVN_URL"
+     printf -v CHANGED_MODULES "$CHANGED_MODULES%s\n" $module
+     echo "import jenkins.*;\\
+           import  jenkins.model.*;\\
+           import  hudson.*;\\
+           import hudson.model.*;\\
+           def jenkins = hudson.model.Hudson.instance;\\
+           def job = jenkins.getItem(\"$module\");\\
+                if (job == null) {
+                        println(\"Job is null, creating it\");\\
+                        def template = jenkins.getItem(\"$TEMPLATE_JOB_NAME\");\\
+                        def newJob = jenkins.copy(template, \"$module\");\\
+			newJob.scm = new hudson.scm.SubversionSCM(Arrays.asList( \\
+         		new hudson.scm.SubversionSCM.ModuleLocation(\"$SVN_URL\", \".\")),\\
+                new hudson.scm.subversion.UpdateWithCleanUpdater(),null,null,null,null,null,null);\\
+                        newJob.setDescription(\"Job created automatically at $REV\");\\
+                        newJob.save();\\
+                }
+              exit" | /usr/bin/ssh -i /var/fenix/jenkins/id_rsa -p 1414 jenkins@localhost groovysh
+    fi
+  done
+done
+
+for changedmodule in $CHANGED_MODULES
+ do
+        echo 'Changed module:' $changedmodule
+	/usr/bin/wget --delete-after -b http://fenix-ashes.ist.utl.pt/jenkins/job/$changedmodule/buildWithParameters?token=buildThisPls\&deploy=true > /dev/null
+done
+
+echo 'CHANGED_MODULES:' $CHANGED_MODULES
+}
+
+FENIX=$(/usr/bin/svnlook -r $REV dirs-changed $REPOS | grep trunk/fenix)
+if [ -z "$FENIX" ] 
+then
+	echo "*INFO/DEBUG*: no updates found to the Fenix code"
+else
+	/usr/bin/wget --delete-after -b http://fenix-ashes.ist.utl.pt/jenkins/job/Fenix/build?token=buildFenixPlease >/dev/null
+	echo "*INFO/DEBUG*: found updates to the Fenix code, triggered jenkins"
+fi
+
+FENIX_SCRIPTS=$(/usr/bin/svnlook -r $REV dirs-changed $REPOS | grep trunk/scripts)
+if [ -z "$FENIX_SCRIPTS" ]
+then
+	echo "*INFO/DEBUG*: no updates found to the Fenix-scripts code"
+else 
+	 /usr/bin/wget --delete-after -b http://fenix-ashes.ist.utl.pt/jenkins/job/Fenix-scripts/build?token=buildFenixScriptsPlease >/dev/null
+	echo "*INFO/DEBUG*: found updates to the Fenix Scripts code, triggered jenkins"
+fi
+
+#Bennu
+
+BENNU=$(/usr/bin/svnlook -r $REV dirs-changed $REPOS | grep trunk)
+if [ -z "$BENNU" ]
+then
+        echo "*INFO/DEBUG*: no updates found to the Bennu code"
+else
+processMavenizedCommit "trunk/" "MavenBennuTemplateJob"
+fi
+
+
+#Sandbox test
+
+SANDBOX_BENNU=$(/usr/bin/svnlook -r $REV dirs-changed $REPOS | grep sandbox/jenkinsSandbox)
+if [ -z "$SANDBOX_BENNU" ]
+then
+	echo "*INFO/DEBUG*: no updates found to the SANDBOXED Bennu code"
+else 
+	processMavenizedCommit "sandbox/jenkinsSandbox/" "MavenBennuTemplateJob";
+fi
+#/usr/share/subversion/hook-scripts/commit-email.pl "$REPOS" "$REV" commit-watchers@example.org
